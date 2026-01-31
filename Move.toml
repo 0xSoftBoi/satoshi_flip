@@ -1,0 +1,10 @@
+[package]
+name = "satoshi_flip"
+version = "0.0.1"
+edition = "2024.alpha"
+
+[dependencies]
+Sui = { git = "https://github.com/MystenLabs/sui.git", subdir = "crates/sui-framework/packages/sui-framework", rev = "mainnet-v1.15.1" }
+
+[addresses]
+satoshi_flip = "0x0"

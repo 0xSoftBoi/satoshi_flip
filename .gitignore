@@ -1,0 +1,6 @@
+node_modules/
+.next/
+build/
+Move.lock
+.env
+.DS_Store
