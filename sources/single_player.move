@@ -18,7 +18,7 @@ module satoshi_flip::single_player {
     use satoshi_flip::house_data::{Self, HouseData};
 
     // ==================== Error Codes ====================
-    
+
     /// Stake amount is below minimum
     const EStakeTooLow: u64 = 0;
     /// Stake amount is above maximum
@@ -29,6 +29,8 @@ module satoshi_flip::single_player {
     const EInvalidBlsSignature: u64 = 3;
     /// Invalid guess (must be 0 or 1)
     const EInvalidGuess: u64 = 4;
+    /// Caller is not the house admin
+    const ENotAdmin: u64 = 5;
 
     // ==================== Constants ====================
 
@@ -125,12 +127,15 @@ module satoshi_flip::single_player {
 
     /// House finishes the game by providing a BLS signature over the game ID
     /// The signature is used to derive randomness for the coin flip
+    /// Only the house admin may call this function.
     public fun finish_game(
         game: Game,
         bls_sig: vector<u8>,
         house_data: &mut HouseData,
         ctx: &mut TxContext
     ) {
+        assert!(ctx.sender() == house_data::house(house_data), ENotAdmin);
+
         let Game {
             id,
             guess,
@@ -194,14 +199,16 @@ module satoshi_flip::single_player {
         object::delete(id);
     }
 
-    /// Alternative: Finish game using Sui's native randomness (simpler approach)
-    /// This uses a simpler random number approach for testing purposes
+    /// Alternative: Finish game using a caller-supplied random value.
+    /// DEPRECATED: This function is admin-gated to prevent players from
+    /// controlling the outcome. Use finish_game() with a BLS signature instead.
     public fun finish_game_with_randomness(
         game: Game,
         random_value: u8,
         house_data: &mut HouseData,
         ctx: &mut TxContext
     ) {
+        assert!(ctx.sender() == house_data::house(house_data), ENotAdmin);
         let Game {
             id,
             guess,

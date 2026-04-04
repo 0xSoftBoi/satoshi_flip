@@ -72,15 +72,17 @@ contract ZuniswapV2Router {
         IZuniswapV2Pair(pair).transferFrom(msg.sender, pair, liquidity);
         (amountA, amountB) = IZuniswapV2Pair(pair).burn(to);
         if (amountA < amountAMin) revert InsufficientAAmount();
-        if (amountA < amountBMin) revert InsufficientBAmount();
+        if (amountB < amountBMin) revert InsufficientBAmount();
     }
 
     function swapExactTokensForTokens(
         uint256 amountIn,
         uint256 amountOutMin,
         address[] calldata path,
-        address to
+        address to,
+        uint256 deadline
     ) public returns (uint256[] memory amounts) {
+        require(block.timestamp <= deadline, "EXPIRED");
         amounts = ZuniswapV2Library.getAmountsOut(
             address(factory),
             amountIn,
@@ -101,8 +103,10 @@ contract ZuniswapV2Router {
         uint256 amountOut,
         uint256 amountInMax,
         address[] calldata path,
-        address to
+        address to,
+        uint256 deadline
     ) public returns (uint256[] memory amounts) {
+        require(block.timestamp <= deadline, "EXPIRED");
         amounts = ZuniswapV2Library.getAmountsIn(
             address(factory),
             amountOut,
