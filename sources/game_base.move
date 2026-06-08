@@ -8,7 +8,7 @@
 /// Games import this module and call these helpers directly.
 module satoshi_flip::game_base {
 
-    use satoshi_flip::house_data::HouseData;
+    use satoshi_flip::house_data::{Self, HouseData};
 
     // ==================== Error Codes ====================
 

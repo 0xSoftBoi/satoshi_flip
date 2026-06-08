@@ -8,7 +8,8 @@ module satoshi_flip::single_player_tests {
     use sui::coin::{Self, Coin};
     use sui::sui::SUI;
     use sui::test_utils;
-    
+    use sui::random::{Self, Random};
+
     use satoshi_flip::house_data::{Self, HouseData, HouseCap};
     use satoshi_flip::single_player::{Self, Game};
 
@@ -119,9 +120,9 @@ module satoshi_flip::single_player_tests {
             // House should have paid out winnings
             let final_house_balance = house_data::balance(&house_data);
             
-            // House loses stake minus fees
-            let fee = STAKE_AMOUNT / 100;
-            let expected_loss = STAKE_AMOUNT - fee;
+            // The house *balance* pool drops by the full stake; the fee it keeps is
+            // moved into the separate fees pool, so net economic loss is stake - fee.
+            let expected_loss = STAKE_AMOUNT;
             assert!(initial_house_balance - final_house_balance == expected_loss, 0);
             
             ts::return_shared(house_data);
@@ -131,9 +132,9 @@ module satoshi_flip::single_player_tests {
         ts::next_tx(&mut scenario, PLAYER_ADDRESS);
         {
             let payout = ts::take_from_sender<Coin<SUI>>(&scenario);
-            // Player gets stake + winnings - fee = 2 * stake - fee
+            // Player gets stake back + winnings, minus a single fee = 2*stake - fee.
             let fee = STAKE_AMOUNT / 100;
-            let expected_payout = 2 * STAKE_AMOUNT - 2 * fee;
+            let expected_payout = 2 * STAKE_AMOUNT - fee;
             assert!(coin::value(&payout) == expected_payout, 0);
             
             test_utils::destroy(payout);
@@ -263,6 +264,82 @@ module satoshi_flip::single_player_tests {
 
             ts::return_shared(house_data);
         };
+
+        ts::end(scenario);
+    }
+
+    // A garbage signature must be rejected by the BLS gate (this path was previously
+    // untested — the other tests use the deterministic test-only settle).
+    #[test]
+    #[expected_failure(abort_code = single_player::EInvalidBlsSignature)]
+    fun test_invalid_bls_signature_fails() {
+        let mut scenario = ts::begin(HOUSE_ADDRESS);
+        setup_house(&mut scenario);
+
+        ts::next_tx(&mut scenario, PLAYER_ADDRESS);
+        {
+            let mut house_data = ts::take_shared<HouseData>(&scenario);
+            let stake = mint_coin(STAKE_AMOUNT, &mut scenario);
+            single_player::create_game(0, stake, &mut house_data, ts::ctx(&mut scenario));
+            ts::return_shared(house_data);
+        };
+
+        ts::next_tx(&mut scenario, HOUSE_ADDRESS);
+        {
+            let game = ts::take_shared<Game>(&scenario);
+            let mut house_data = ts::take_shared<HouseData>(&scenario);
+            let bad_sig = vector[0u8, 0, 0, 0]; // not a valid BLS signature
+            single_player::finish_game(game, bad_sig, &mut house_data, ts::ctx(&mut scenario));
+            ts::return_shared(house_data);
+        };
+
+        ts::end(scenario);
+    }
+
+    // The trustless native-randomness path settles the game (consumes it and pays out),
+    // and — unlike the BLS path — anyone, not just the house, can trigger it.
+    #[test]
+    fun test_native_randomness_settles() {
+        let mut scenario = ts::begin(HOUSE_ADDRESS);
+        setup_house(&mut scenario);
+
+        // Create + seed the system Random object (normally lives at 0x8).
+        ts::next_tx(&mut scenario, @0x0);
+        { random::create_for_testing(ts::ctx(&mut scenario)); };
+        ts::next_tx(&mut scenario, @0x0);
+        {
+            let mut r = ts::take_shared<Random>(&scenario);
+            random::update_randomness_state_for_testing(
+                &mut r,
+                0,
+                x"0101010101010101010101010101010101010101010101010101010101010101",
+                ts::ctx(&mut scenario)
+            );
+            ts::return_shared(r);
+        };
+
+        ts::next_tx(&mut scenario, PLAYER_ADDRESS);
+        {
+            let mut house_data = ts::take_shared<HouseData>(&scenario);
+            let stake = mint_coin(STAKE_AMOUNT, &mut scenario);
+            single_player::create_game(0, stake, &mut house_data, ts::ctx(&mut scenario));
+            ts::return_shared(house_data);
+        };
+
+        // A non-house caller settles via native randomness.
+        ts::next_tx(&mut scenario, PLAYER_ADDRESS);
+        {
+            let game = ts::take_shared<Game>(&scenario);
+            let mut house_data = ts::take_shared<HouseData>(&scenario);
+            let r = ts::take_shared<Random>(&scenario);
+            single_player::finish_game_native(game, &mut house_data, &r, ts::ctx(&mut scenario));
+            ts::return_shared(house_data);
+            ts::return_shared(r);
+        };
+
+        // Game object was consumed (settled).
+        ts::next_tx(&mut scenario, PLAYER_ADDRESS);
+        { assert!(!ts::has_most_recent_shared<Game>(), 0); };
 
         ts::end(scenario);
     }
