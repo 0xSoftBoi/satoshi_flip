@@ -4,7 +4,10 @@ version = "0.0.1"
 edition = "2024.alpha"
 
 [dependencies]
-Sui = { git = "https://github.com/MystenLabs/sui.git", subdir = "crates/sui-framework/packages/sui-framework", rev = "framework/mainnet" }
+# Pinned to a specific commit (was the moving branch `framework/mainnet`) so builds are
+# reproducible. This rev includes `sui::random` (needed for the native-randomness path);
+# Move.lock records the full resolution and is committed alongside this.
+Sui = { git = "https://github.com/MystenLabs/sui.git", subdir = "crates/sui-framework/packages/sui-framework", rev = "14bf3e318215db21415c7c0ab0c01cf8d7ef594a" }
 
 [addresses]
 satoshi_flip = "0x0"

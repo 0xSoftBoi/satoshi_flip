@@ -1,6 +1,6 @@
-node_modules/
-.next/
 build/
-Move.lock
 .env
 .DS_Store
+*.bak
+
+# Move.lock IS committed (it pins the exact framework commit for reproducible builds).

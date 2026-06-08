@@ -34,6 +34,7 @@ module satoshi_flip::dice {
     use sui::event;
     use sui::bls12381;
     use sui::hash::blake2b256;
+    use sui::random::{Self, Random};
 
     use satoshi_flip::house_data::{Self, HouseData};
     use satoshi_flip::game_base;
@@ -176,47 +177,70 @@ module satoshi_flip::dice {
         let is_valid = bls12381::bls12381_min_pk_verify(&bls_sig, &public_key, &game_id);
         assert!(is_valid, EInvalidBlsSignature);
 
-        // Derive outcome from hash of signature
+        // Derive outcome from hash of signature.
+        // NOTE: `% sides` is slightly biased when `sides` does not divide 256. The
+        // native path below (finish_game_native) avoids this via generate_u8_in_range.
         let hash = blake2b256(&bls_sig);
-        // Take first byte, reduce modulo sides → 0-indexed [0, sides-1], add 1 → 1-indexed
-        let outcome_0indexed = (*vector::borrow(&hash, 0) % sides);
-        let outcome = outcome_0indexed + 1;
+        let outcome = (*vector::borrow(&hash, 0) % sides) + 1; // 1-indexed
 
+        settle(stake, fee_amount, sides, guess, player, outcome, game_id, house_data, ctx);
+    }
+
+    /// Trustless settlement using Sui's native on-chain randomness (DKG-derived).
+    ///
+    /// MUST be `entry`, not `public`: an `entry` function cannot be called from another
+    /// Move function, so a composing caller cannot read the randomness, branch on the
+    /// outcome, and abort the transaction if it dislikes the result. Making a function
+    /// that consumes `&Random` `public` reintroduces exactly that "preview-and-abort"
+    /// attack. See RANDOMNESS.md.
+    entry fun finish_game_native(
+        game: DiceGame,
+        house_data: &mut HouseData,
+        r: &Random,
+        ctx: &mut TxContext
+    ) {
+        let DiceGame { id, sides, guess, player, stake, fee_amount } = game;
+        let game_id = object::uid_to_bytes(&id);
+        object::delete(id);
+
+        let mut gen = random::new_generator(r, ctx);
+        let outcome = random::generate_u8_in_range(&mut gen, 1, sides); // unbiased, 1..=sides
+
+        settle(stake, fee_amount, sides, guess, player, outcome, game_id, house_data, ctx);
+    }
+
+    /// Shared payout/settlement logic for both the BLS and native paths.
+    /// The house takes its fee exactly once; the winner receives `stake * sides - fee`.
+    fun settle(
+        stake: Balance<SUI>,
+        fee_amount: u64,
+        sides: u8,
+        guess: u8,
+        player: address,
+        outcome: u8,
+        game_id: vector<u8>,
+        house_data: &mut HouseData,
+        ctx: &mut TxContext
+    ) {
         let won = guess == outcome;
         let stake_amount = balance::value(&stake);
-
         let payout: u64;
+
         if (won) {
-            // Deduct fee from stake, calculate gross payout
-            let (net_payout, fee) = game_base::calculate_payout(
-                stake_amount,
-                sides as u64,
-                1,
-                house_data::base_fee_in_bp(house_data)
-            );
-            // House contributes (sides-1) * stake to the payout pool
-            let house_contribution = (stake_amount as u128) * ((sides - 1) as u128);
-            let house_bal = house_data::balance_mut(house_data);
-            balance::join(house_bal, stake);
-
-            // Transfer fee to house fee accumulator
-            let fee_bal = house_data::fees_mut(house_data);
-            let fee_coin = balance::split(house_bal, fee);
-            balance::join(fee_bal, fee_coin);
-
-            // Send net_payout to player
-            let win_balance = balance::split(house_bal, net_payout);
-            let win_coin = coin::from_balance(win_balance, ctx);
-            transfer::public_transfer(win_coin, player);
+            // sides:1 gross payout, the house's fee taken exactly once.
+            let gross = ((stake_amount as u128) * (sides as u128)) as u64;
+            let net_payout = gross - fee_amount;
+            let house_bal = house_data::borrow_balance_mut(house_data);
+            balance::join(house_bal, stake);                        // pool in the stake
+            let fee_coin = balance::split(house_bal, fee_amount);   // house edge
+            let win_balance = balance::split(house_bal, net_payout); // winner's payout
+            // house_bal no longer used past here — safe to borrow the fee pool now.
+            balance::join(house_data::borrow_fees_mut(house_data), fee_coin);
+            transfer::public_transfer(coin::from_balance(win_balance, ctx), player);
             payout = net_payout;
-            let _ = house_contribution;
         } else {
-            // House wins: player's stake + fee goes to house
-            let house_bal = house_data::balance_mut(house_data);
-            let fee_bal = house_data::fees_mut(house_data);
-            let fee_coin = balance::split(&mut stake, fee_amount);
-            balance::join(fee_bal, fee_coin);
-            balance::join(house_bal, stake);
+            // House wins: the player's entire stake goes to the house.
+            balance::join(house_data::borrow_balance_mut(house_data), stake);
             payout = 0;
         };
 
@@ -228,5 +252,20 @@ module satoshi_flip::dice {
             won,
             payout,
         });
+    }
+
+    /// Test-only deterministic settlement so unit tests can force a specific face
+    /// without an off-chain BLS signer or real randomness.
+    #[test_only]
+    public fun finish_game_for_testing(
+        game: DiceGame,
+        outcome: u8,
+        house_data: &mut HouseData,
+        ctx: &mut TxContext
+    ) {
+        let DiceGame { id, sides, guess, player, stake, fee_amount } = game;
+        let game_id = object::uid_to_bytes(&id);
+        object::delete(id);
+        settle(stake, fee_amount, sides, guess, player, outcome, game_id, house_data, ctx);
     }
 }

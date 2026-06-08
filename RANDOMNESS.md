@@ -1,159 +1,122 @@
 # On-Chain Randomness: BLS vs Native Sui Randomness
 
-This document explains why on-chain randomness is hard, how this package currently implements it (BLS signatures), and how to migrate to Sui's native randomness module — which is strictly better for production use.
+This package settles each game two ways, on purpose, to show the trade-off:
+
+- **`finish_game`** — house-signed **BLS** randomness. *Verifiable, but house-trusted.*
+- **`finish_game_native`** — Sui's **native `Random`**. *Trustless, and the recommended default.*
+
+This document explains why on-chain randomness is hard, what each path actually buys
+you, and the one footgun that makes the "trustless" path easy to get wrong.
 
 ---
 
-## 1. Why On-Chain Randomness is Hard
+## 1. Why on-chain randomness is hard
 
-A blockchain is a deterministic system: every node must compute the same result from the same inputs. "True" randomness violates this — if two nodes generate different random numbers, consensus breaks.
+A blockchain is deterministic: every node must compute the same result from the same
+inputs. "True" randomness would break consensus. The naive fixes all leak:
 
-### Failed approaches
-
-**Block hash as random seed**  
-`block.prevrandao` or `block.timestamp` are publicly visible before transactions execute. A miner/validator can re-roll the block until they get a favorable outcome. Cheap to exploit, never appropriate for any meaningful value.
-
-**Commit-reveal**  
-Two-phase: player commits to a hash of their secret in tx1, reveals the secret in tx2. The random number is `hash(player_secret, house_secret)`.
-
-*Problem:* The second revealer (usually the house) can refuse to reveal if the outcome is unfavorable (griefing attack). The first revealer is stuck. Requires a timeout mechanism that adds complexity and capital risk.
-
-**VRF (Verifiable Random Function)**  
-A VRF produces a pseudorandom output + cryptographic proof that the output was generated honestly from a specific private key and input. Used by Chainlink VRF on EVM chains.
-
-*Problem on Sui:* External oracles introduce a trust dependency and latency. The VRF provider could be bribed, coerced, or simply go offline.
+- **Block hash / `timestamp` / `prevrandao`** — visible to the block producer before
+  execution, who can re-roll the block until the outcome suits them. Never safe for value.
+- **Commit-reveal** — the second revealer (usually the house) can refuse to reveal on a
+  bad outcome (griefing). Needs a timeout and capital lock-up.
+- **External VRF (e.g. Chainlink)** — adds an oracle you have to trust to be live and
+  uncorrupted; extra latency.
 
 ---
 
-## 2. BLS Signature Randomness (Current Implementation)
+## 2. BLS-signature randomness — verifiable, but *house-trusted*
 
-### How it works
+### How it works (`finish_game` / `dice::finish_game`)
 
-1. Player creates a game object. The game's `UID` (object ID) is unpredictable at creation time because it depends on the transaction digest.
-2. House signs the game's object ID bytes using its BLS12-381 private key.
-3. The contract verifies the signature with `bls12381::bls12381_min_pk_verify(sig, pub_key, game_id)`.
-4. The Blake2b256 hash of the verified signature is used as the random seed.
+1. The player creates a game object. Its `UID` depends on the transaction digest, so it
+   is not predictable before the player signs.
+2. The house signs the game's id bytes with its BLS12-381 key.
+3. The contract verifies with `bls12381::bls12381_min_pk_verify(sig, pub_key, game_id)`
+   and derives the outcome from `blake2b256(sig)`.
 
-### Why game_id is unmanipulable
+Because BLS is **deterministic**, there is exactly one valid signature per (key, game id).
+So the house *cannot* "re-sign until it likes the outcome" — that attack doesn't exist.
 
-The game object ID is derived from `hash(tx_digest || counter)`. The transaction digest includes the player's signature — the house cannot predict it before the player signs. Therefore, the house cannot pre-compute a BLS signature that produces a favorable outcome.
+### …but that is not the same as trustless
 
-### The house re-sign attack
+The residual trust is **selective participation**, and it is the headline, not a footnote:
 
-However: what if the house simply refuses to submit a settlement transaction until it happens to find a BLS signature that produces a favorable outcome?
+> BLS being deterministic *also* means the house can compute the outcome of any game
+> **off-chain, in advance** — it just signs the id and hashes it. It cannot change a
+> given game's outcome, but it never has to play one it would lose. It can simply
+> **not settle** unfavorable games ("technical issues"), or screen which games it
+> creates/accepts. The player has no on-chain recourse without a settlement timeout.
 
-```
-// Pseudocode attack:
-loop {
-    sig = bls_sign(private_key, game_id)
-    outcome = blake2b256(sig)[0] % 2  // 0=heads, 1=tails
-    if (outcome == house_preferred) {
-        submit finish_game(game, sig)
-    }
-    // else: generate another sig? No — BLS is deterministic.
-}
-```
+So BLS is **verifiable** (anyone can check the signature) but **not trustless** (you are
+trusting the house to settle honestly and promptly). Other assumptions: key custody (a
+leaked house key breaks every game) and key rotation.
 
-**Actually, BLS is deterministic** — given the same key and message, it always produces the same signature. The house cannot "try again" with a different BLS signature for the same game_id/key pair. There is exactly ONE valid BLS signature per (key, message) pair.
-
-**So BLS is actually safe against the re-sign attack** — as long as:
-1. The house uses a single, fixed private key (no rotating keys)
-2. The house key is not known to the player in advance
-
-### Remaining trust assumptions
-
-- **Key custody**: The house controls the BLS private key. A compromised house key compromises all games.
-- **Key rotation**: If the house rotates keys, players must trust the new key. A malicious key rotation attack is possible.
-- **Bias by timing**: The house can delay settlement indefinitely. While it cannot change the outcome, it can refuse to settle unfavorable games and claim "technical issues." A timeout mechanism is essential for production.
-
-### Summary: BLS is appropriate when:
-- Game value is modest (low incentive to corrupt key custody)
-- House is a known, accountable entity
-- Timeout/dispute mechanism exists for non-settlement
+**BLS is appropriate when** the stakes are modest, the house is a known/accountable
+entity, and there is a settlement-timeout/dispute path. It is *not* "provably fair."
 
 ---
 
-## 3. Sui Native Randomness (Recommended for Production)
+## 3. Native Sui randomness — trustless (implemented as `finish_game_native`)
 
-Sui introduced `sui::random::Random` as a shared object backed by the validators' distributed key generation (DKG) protocol. Every epoch, validators collectively generate a new random seed using threshold secret sharing. No single validator knows the full seed — a 2/3 majority would need to collude.
+Sui's `sui::random::Random` is a shared system object (`0x8`) backed by the validators'
+distributed key generation. No single validator knows the seed; a ⅔ majority would have
+to collude. `new_generator(r, ctx)` seeds a local PRNG from that beacon plus
+transaction entropy.
 
-### API (framework >= v1.19)
+This package implements it directly:
 
 ```move
 use sui::random::{Self, Random};
 
-// In your entry function — `r` is the shared Random object (address 0x8)
-public fun finish_game(game: MyGame, r: &Random, ctx: &mut TxContext) {
-    // Create a generator seeded from the validator DKG + current tx
+/// MUST be `entry`, not `public` — see the footgun below.
+entry fun finish_game_native(
+    game: Game,
+    house_data: &mut HouseData,
+    r: &Random,
+    ctx: &mut TxContext
+) {
     let mut gen = random::new_generator(r, ctx);
-    
-    // Generate a random bool (coin flip)
-    let flip: bool = random::generate_bool(&mut gen);
-    
-    // Or a u8 in range [1, sides] for a dice game
-    let roll: u8 = random::generate_u8_in_range(&mut gen, 1, sides);
+    let coin_side = random::generate_u8_in_range(&mut gen, 0, 1); // dice: (&mut gen, 1, sides)
+    // ... settle ...
 }
 ```
 
-The `Random` object at `0x8` is a system object updated every epoch. The `new_generator` call seeds a local PRNG from the validator DKG output + transaction-specific entropy, making each call unique within a transaction.
+Why it's strictly better here: it removes the house's selective-participation power
+(**anyone** can call `finish_game_native` — the outcome is fair regardless of caller),
+needs no off-chain signing service, and `generate_u8_in_range` is **unbiased** (the BLS
+path's `byte % sides` is slightly biased whenever `sides` doesn't divide 256).
 
-### Why it's better than BLS
+### ⚠️ The footgun: the consumer of `&Random` must be a private `entry` function
 
-| Property | BLS (current) | Native Random |
+If you make a function that reads randomness `public`, you reintroduce a bias attack —
+just a different one:
+
+> A `public` function can be called from *another* Move function. A caller can invoke it,
+> read the result, branch on it, and **abort the whole transaction** if the outcome is a
+> loss — retrying until they win, paying only gas. This "preview-and-abort" is exactly
+> what `entry` prevents: an `entry` function cannot be called from other Move code, only
+> as a top-level transaction command, so its effects can't be inspected-and-reverted by a
+> composing caller.
+
+Rules of thumb, straight from Sui's randomness guidance: the function that consumes
+`&Random` should be **`entry` and non-`public`**; do all randomness-dependent effects
+(payouts, deletes) inside it; and don't let a caller observe the result before it commits.
+
+| Property | BLS (`finish_game`) | Native (`finish_game_native`) |
 |---|---|---|
-| Unpredictable by player? | Yes | Yes |
-| Unpredictable by house? | Yes (but house controls settlement timing) | Yes |
-| Requires off-chain infrastructure? | Yes (house signing service) | No |
-| Trust assumption | Single house key | 2/3+ of validators |
-| Bias by delay | Possible (house delays bad outcomes) | Not possible (validators settle) |
-| Key rotation risk | Yes | No |
-| Requires oracle? | No | No |
-
-### Migration guide
-
-To migrate `single_player.move` from BLS to native random:
-
-```move
-// Remove:
-use sui::bls12381;
-use sui::hash::blake2b256;
-
-// Add:
-use sui::random::{Self, Random};
-
-// Old finish_game signature:
-public fun finish_game(game: Game, bls_sig: vector<u8>, house_data: &mut HouseData, ctx: &mut TxContext)
-
-// New finish_game signature (Random is a shared object, passed by reference):
-public fun finish_game(game: Game, r: &Random, house_data: &mut HouseData, ctx: &mut TxContext)
-
-// Old randomness block:
-// let hash = blake2b256(&bls_sig);
-// let coin_side = *vector::borrow(&hash, 0) % 2;
-
-// New randomness block:
-let mut gen = random::new_generator(r, ctx);
-let coin_side: u8 = if (random::generate_bool(&mut gen)) { 1 } else { 0 };
-```
-
-The `Random` object address is `0x8` on both testnet and mainnet. When calling `finish_game`, pass it as:
-```bash
-sui client call --function finish_game --args <game_id> 0x8 <house_data_id>
-```
-
-### When BLS is still acceptable
-
-- Low-value games where the house has no economic incentive to manipulate
-- Situations where you want deterministic test vectors (BLS is predictable in tests)
-- Educational projects (this repository)
+| Unpredictable by player | yes | yes |
+| Unpredictable by house | the *value* yes, but house controls *whether/when to settle* | yes |
+| Selective participation / bias-by-delay | **possible** | not possible (anyone settles) |
+| Off-chain infra | house signing service | none |
+| Trust root | one house key | ⅔ of validators |
+| Outcome bias | `byte % n` slightly biased | unbiased range |
+| Footgun | — | must be `entry`, not `public` |
 
 ---
 
-## 4. Further Reading
+## 4. Further reading
 
-- [Sui Randomness Design](https://docs.sui.io/guides/developer/advanced/randomness-onchain)
-- [Sui Random module source](https://github.com/MystenLabs/sui/blob/main/crates/sui-framework/packages/sui-framework/sources/random.move)
+- [Sui on-chain randomness guide](https://docs.sui.io/guides/developer/advanced/randomness-onchain) (see the "important limitations" on `entry`)
+- [`sui::random` source](https://github.com/MystenLabs/sui/blob/main/crates/sui-framework/packages/sui-framework/sources/random.move)
 - [MystenLabs satoshi-coin-flip (official example)](https://github.com/MystenLabs/satoshi-coin-flip)
-- [Drand — distributed randomness beacon](https://drand.love)
-- [Chainlink VRF](https://docs.chain.link/vrf)
-- [Commit-reveal schemes — Ethereum](https://medium.com/swlh/exploring-commit-reveal-schemes-on-ethereum-c4ff5a777db8)
+- [Drand — distributed randomness beacon](https://drand.love) · [Chainlink VRF](https://docs.chain.link/vrf)

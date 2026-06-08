@@ -14,6 +14,7 @@ module satoshi_flip::single_player {
     use sui::event;
     use sui::bls12381;
     use sui::hash::blake2b256;
+    use sui::random::{Self, Random};
 
     use satoshi_flip::house_data::{Self, HouseData};
 
@@ -128,6 +129,12 @@ module satoshi_flip::single_player {
     /// House finishes the game by providing a BLS signature over the game ID
     /// The signature is used to derive randomness for the coin flip
     /// Only the house admin may call this function.
+    /// House settles the game by providing a BLS signature over the game ID.
+    ///
+    /// Verifiable, but house-*trusted*: BLS is deterministic, so the house can compute
+    /// the outcome of any game off-chain before settling and simply decline to settle
+    /// (or never create) games it would lose. For trustless play, use
+    /// `finish_game_native`. See RANDOMNESS.md.
     public fun finish_game(
         game: Game,
         bls_sig: vector<u8>,
@@ -136,72 +143,86 @@ module satoshi_flip::single_player {
     ) {
         assert!(ctx.sender() == house_data::house(house_data), ENotAdmin);
 
-        let Game {
-            id,
-            guess,
-            player,
-            stake,
-            fee_amount
-        } = game;
-
+        let Game { id, guess, player, stake, fee_amount } = game;
         let game_id = object::uid_to_inner(&id);
-
-        // Verify BLS signature
         let msg = object::uid_to_bytes(&id);
+        object::delete(id);
+
+        // Verify the house signed THIS game's id.
         let public_key = house_data::public_key(house_data);
         assert!(
             bls12381::bls12381_min_pk_verify(&bls_sig, &public_key, &msg),
             EInvalidBlsSignature
         );
 
-        // Use the BLS signature to derive randomness
         let hashed = blake2b256(&bls_sig);
         let coin_side = (*std::vector::borrow(&hashed, 0)) % 2;
 
-        // Determine winner
-        let player_won = (coin_side == guess);
+        settle(stake, fee_amount, guess, player, coin_side, game_id, house_data, ctx);
+    }
 
+    /// Trustless settlement using Sui's native on-chain randomness (DKG-derived).
+    /// Anyone may call it — the outcome is fair regardless of caller — which is the
+    /// whole point: it removes the house's selective-participation power.
+    ///
+    /// MUST be `entry`, not `public`: an `entry` function can't be called from another
+    /// Move function, so a composing caller can't read the result, branch on it, and
+    /// abort the transaction on a loss ("preview-and-abort"). See RANDOMNESS.md.
+    entry fun finish_game_native(
+        game: Game,
+        house_data: &mut HouseData,
+        r: &Random,
+        ctx: &mut TxContext
+    ) {
+        let Game { id, guess, player, stake, fee_amount } = game;
+        let game_id = object::uid_to_inner(&id);
+        object::delete(id);
+
+        let mut gen = random::new_generator(r, ctx);
+        let coin_side = random::generate_u8_in_range(&mut gen, 0, 1);
+
+        settle(stake, fee_amount, guess, player, coin_side, game_id, house_data, ctx);
+    }
+
+    /// Shared payout logic. On a player win the house pays 2:1 minus a single fee, so
+    /// the player receives exactly `2*stake - fee` (and the emitted `payout` matches
+    /// what is transferred). On a house win the player's whole stake goes to the house.
+    fun settle(
+        stake: Balance<SUI>,
+        fee_amount: u64,
+        guess: u8,
+        player: address,
+        coin_side: u8,
+        game_id: ID,
+        house_data: &mut HouseData,
+        ctx: &mut TxContext
+    ) {
+        let player_won = (coin_side == guess);
         let stake_amount = balance::value(&stake);
         let payout: u64;
-        let house_balance = house_data::borrow_balance_mut(house_data);
 
         if (player_won) {
-            // Player wins: gets stake back + equal amount from house - fees
-            let winnings = balance::split(house_balance, stake_amount - fee_amount);
-            let mut player_balance = stake;
-            balance::join(&mut player_balance, winnings);
-            
-            payout = balance::value(&player_balance);
-            
-            // Take fees and add to house fees
-            let fees = balance::split(&mut player_balance, fee_amount);
-            let house_fees = house_data::borrow_fees_mut(house_data);
-            balance::join(house_fees, fees);
-
-            // Transfer winnings to player
-            transfer::public_transfer(coin::from_balance(player_balance, ctx), player);
+            let gross = ((stake_amount as u128) * 2) as u64; // 2:1
+            let net_payout = gross - fee_amount;
+            let house_balance = house_data::borrow_balance_mut(house_data);
+            balance::join(house_balance, stake);                       // pool the stake
+            let fee_coin = balance::split(house_balance, fee_amount);  // house edge (once)
+            let win_balance = balance::split(house_balance, net_payout);
+            balance::join(house_data::borrow_fees_mut(house_data), fee_coin);
+            transfer::public_transfer(coin::from_balance(win_balance, ctx), player);
+            payout = net_payout;
         } else {
-            // House wins: stake goes to house balance
-            balance::join(house_balance, stake);
+            balance::join(house_data::borrow_balance_mut(house_data), stake);
             payout = 0;
         };
 
-        // Emit game settled event
-        event::emit(GameSettled {
-            game_id,
-            player,
-            player_won,
-            payout,
-            coin_side
-        });
-
-        // Delete game object
-        object::delete(id);
+        event::emit(GameSettled { game_id, player, player_won, payout, coin_side });
     }
 
-    /// Alternative: Finish game using a caller-supplied random value.
-    /// DEPRECATED: This function is admin-gated to prevent players from
-    /// controlling the outcome. Use finish_game() with a BLS signature instead.
+    /// Test-only deterministic settlement: lets unit tests force heads/tails without an
+    /// off-chain BLS signer or real randomness. Admin-gated and `#[test_only]` so it
+    /// cannot be a production backdoor around the randomness.
+    #[test_only]
     public fun finish_game_with_randomness(
         game: Game,
         random_value: u8,
@@ -209,56 +230,11 @@ module satoshi_flip::single_player {
         ctx: &mut TxContext
     ) {
         assert!(ctx.sender() == house_data::house(house_data), ENotAdmin);
-        let Game {
-            id,
-            guess,
-            player,
-            stake,
-            fee_amount
-        } = game;
-
+        let Game { id, guess, player, stake, fee_amount } = game;
         let game_id = object::uid_to_inner(&id);
-        let coin_side = random_value % 2;
-
-        // Determine winner
-        let player_won = (coin_side == guess);
-
-        let stake_amount = balance::value(&stake);
-        let payout: u64;
-        let house_balance = house_data::borrow_balance_mut(house_data);
-
-        if (player_won) {
-            // Player wins: gets stake back + equal amount from house - fees
-            let winnings = balance::split(house_balance, stake_amount - fee_amount);
-            let mut player_balance = stake;
-            balance::join(&mut player_balance, winnings);
-            
-            payout = balance::value(&player_balance);
-            
-            // Take fees and add to house fees
-            let fees = balance::split(&mut player_balance, fee_amount);
-            let house_fees = house_data::borrow_fees_mut(house_data);
-            balance::join(house_fees, fees);
-
-            // Transfer winnings to player
-            transfer::public_transfer(coin::from_balance(player_balance, ctx), player);
-        } else {
-            // House wins: stake goes to house balance
-            balance::join(house_balance, stake);
-            payout = 0;
-        };
-
-        // Emit game settled event
-        event::emit(GameSettled {
-            game_id,
-            player,
-            player_won,
-            payout,
-            coin_side
-        });
-
-        // Delete game object
         object::delete(id);
+        let coin_side = random_value % 2;
+        settle(stake, fee_amount, guess, player, coin_side, game_id, house_data, ctx);
     }
 
     // ==================== View Functions ====================
